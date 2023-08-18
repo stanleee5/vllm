@@ -84,7 +84,8 @@ __global__ void single_query_cached_kv_attention_kernel(
   const float* __restrict__ alibi_slopes, // [num_heads]
   const int q_stride,
   const int kv_block_stride,
-  const int kv_head_stride) {
+  const int kv_head_stride,
+  const bool use_lingvo_softmax) {
   constexpr int THREAD_GROUP_SIZE = MAX(WARP_SIZE / BLOCK_SIZE, 1);
   constexpr int NUM_THREAD_GROUPS = NUM_THREADS / THREAD_GROUP_SIZE; // Note: This assumes THREAD_GROUP_SIZE divides NUM_THREADS
   assert(NUM_THREADS % THREAD_GROUP_SIZE == 0);
@@ -215,18 +216,31 @@ __global__ void single_query_cached_kv_attention_kernel(
 
   // Get the sum of the exp values.
   float exp_sum = 0.f;
-  for (int i = thread_idx; i < context_len; i += NUM_THREADS) {
-    float val = __expf(logits[i] - qk_max);
-    logits[i] = val;
-    exp_sum += val;
+  if (use_lingvo_softmax) {
+    float max_logit = fmaxf(0.f, qk_max);
+    for (int i = thread_idx; i < context_len; i += NUM_THREADS) {
+      exp_sum += __expf(logits[i] - max_logit);
+    }
+    exp_sum = block_sum<NUM_WARPS>(&red_smem[NUM_WARPS], exp_sum);
+    for (int i = thread_idx; i < context_len; i += NUM_THREADS) {
+      logits[i] = __expf(logits[i] - max_logit - __logf(exp_sum + __expf(-max_logit)));
+    }
   }
-  exp_sum = block_sum<NUM_WARPS>(&red_smem[NUM_WARPS], exp_sum);
+  else {
+    for (int i = thread_idx; i < context_len; i += NUM_THREADS) {
+      float val = __expf(logits[i] - qk_max);
+      logits[i] = val;
+      exp_sum += val;
+    }
+    exp_sum = block_sum<NUM_WARPS>(&red_smem[NUM_WARPS], exp_sum);
 
-  // Compute softmax.
-  const float inv_sum = __fdividef(1.f, exp_sum + 1e-6f);
-  for (int i = thread_idx; i < context_len; i += NUM_THREADS) {
-    logits[i] *= inv_sum;
+    // Compute softmax.
+    const float inv_sum = __fdividef(1.f, exp_sum + 1e-6f);
+    for (int i = thread_idx; i < context_len; i += NUM_THREADS) {
+      logits[i] *= inv_sum;
+    }
   }
+
   __syncthreads();
 
   // Each thread will fetch 16 bytes from the value cache at a time.
@@ -343,7 +357,8 @@ __global__ void single_query_cached_kv_attention_kernel(
     alibi_slopes_ptr,                                                                         \
     q_stride,                                                                                 \
     kv_block_stride,                                                                          \
-    kv_head_stride);
+    kv_head_stride,                                                                           \
+    use_lingvo_softmax);
 
 // TODO(woosuk): Tune NUM_THREADS.
 template<
@@ -360,7 +375,8 @@ void single_query_cached_kv_attention_launcher(
   torch::Tensor& block_tables,
   torch::Tensor& context_lens,
   int max_context_len,
-  const c10::optional<torch::Tensor>& alibi_slopes) {
+  const c10::optional<torch::Tensor>& alibi_slopes,
+  bool use_lingvo_softmax) {
   int num_seqs = query.size(0);
   int num_heads = query.size(1);
   int head_size = query.size(2);
@@ -441,7 +457,8 @@ void single_query_cached_kv_attention_launcher(
     block_tables,                                                   \
     context_lens,                                                   \
     max_context_len,                                                \
-    alibi_slopes);
+    alibi_slopes,                                                   \
+    use_lingvo_softmax);
 
 // NOTE(woosuk): To reduce the compilation time, we omitted block sizes
 // 1, 2, 4, 64, 128, 256.
@@ -490,7 +507,8 @@ void single_query_cached_kv_attention(
   torch::Tensor& context_lens,    // [num_seqs]
   int block_size,
   int max_context_len,
-  const c10::optional<torch::Tensor>& alibi_slopes) {
+  const c10::optional<torch::Tensor>& alibi_slopes,
+  bool use_lingvo_softmax = false) {
   if (query.dtype() == at::ScalarType::Float) {
     CALL_KERNEL_LAUNCHER_BLOCK_SIZE(float);
   } else if (query.dtype() == at::ScalarType::Half) {

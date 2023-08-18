@@ -156,6 +156,7 @@ class PagedAttention(nn.Module):
             block_size,
             input_metadata.max_context_len,
             None,  # alibi_slopes
+            False,  # use_lingvo_softmax
         )
 
     def forward(
@@ -447,4 +448,5 @@ class PagedAttentionWithALiBi(PagedAttention):
             block_size,
             input_metadata.max_context_len,
             self.alibi_slopes,
+            False,  # use_lingvo_softmax
         )
