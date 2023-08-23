@@ -11,18 +11,33 @@ MAX_SEQ_LEN = 4096
 TEST_SEED = 0
 
 
+def lingvo_softmax(x: torch.Tensor, dim=-1):
+    zero = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+    max_logit, _ = torch.max(x, dim=dim, keepdim=True)
+    max_logit = torch.maximum(max_logit, zero)
+
+    exp_x = torch.exp(x - max_logit)
+    sum_exp_x = torch.sum(exp_x, dim=dim, keepdim=True)
+    return torch.exp(x - max_logit - torch.log(sum_exp_x + torch.exp(-max_logit)))
+
+
 def ref_masked_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     scale: float,
     attn_mask: Optional[torch.Tensor] = None,
+    use_lingvo_softmax: bool = False,
 ) -> torch.Tensor:
     query = query * scale
     attn = torch.einsum("qhd,khd->hqk", query, key)
     if attn_mask is not None:
         attn = attn + attn_mask
-    attn = torch.softmax(attn, dim=-1)
+
+    if use_lingvo_softmax:
+        attn = lingvo_softmax(attn, dim=-1)
+    else:
+        attn = torch.softmax(attn, dim=-1)
     out = torch.einsum("hqk,khd->qhd", attn, value)
     return out
 
@@ -34,6 +49,7 @@ def ref_single_query_cached_kv_attention(
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
     context_lens: torch.Tensor,
+    use_lingvo_softmax: bool = False,
 ) -> None:
     num_heads = value_cache.shape[1]
     head_size = value_cache.shape[2]
@@ -61,7 +77,14 @@ def ref_single_query_cached_kv_attention(
         values = torch.stack(values, dim=0)
 
         scale = 1.0 / (head_size**0.5)
-        out = ref_masked_attention(q, keys, values, scale)
+        out = ref_masked_attention(
+            q,
+            keys,
+            values,
+            scale,
+            attn_mask=None,
+            use_lingvo_softmax=use_lingvo_softmax,
+        )
         out = out.view(num_heads, head_size)
         output[i].copy_(out, non_blocking=True)
 
@@ -72,6 +95,7 @@ def ref_multi_query_kv_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     dtype: torch.dtype,
+    use_lingvo_softmax: bool = False,
 ) -> torch.Tensor:
     head_size = query.shape[-1]
     scale = 1.0 / (head_size**0.5)
@@ -94,6 +118,7 @@ def ref_multi_query_kv_attention(
             value[start_idx:end_idx],
             scale,
             attn_mask=attn_mask,
+            use_lingvo_softmax=use_lingvo_softmax,
         )
         ref_outputs.append(ref_output)
     ref_output = torch.cat(ref_outputs, dim=0)
@@ -168,6 +193,7 @@ def run_single_query_cached_kv_attention(
     num_blocks: int,
     dtype: torch.dtype,
     num_kv_heads: int = None,
+    use_lingvo_softmax: bool = False,
 ) -> None:
     qkv = torch.empty(num_tokens, 3, num_heads, head_size, dtype=dtype, device="cuda")
     qkv.uniform_(-1e-3, 1e-3)
@@ -221,7 +247,7 @@ def run_single_query_cached_kv_attention(
         block_size,
         max_context_len,
         None,  # ALiBi slopes.
-        False,  # use_lingvo_softmax
+        use_lingvo_softmax,
     )
 
     ref_output = torch.empty_like(query)
@@ -232,6 +258,7 @@ def run_single_query_cached_kv_attention(
         value_cache,
         block_tables,
         context_lens,
+        use_lingvo_softmax,
     )
     # NOTE(woosuk): Due to the difference in the data types the two
     # implementations use for attention softmax logits and accumulation,
@@ -317,3 +344,25 @@ def test_multi_query_kv_attention() -> None:
                 head_size=head_size,
                 dtype=dtype,
             )
+
+
+# def test_single_query_cached_kv_attention_lingvo_softmax() -> None:
+#     torch.random.manual_seed(TEST_SEED)
+#     torch.cuda.manual_seed(TEST_SEED)
+#     for dtype in [torch.half, torch.bfloat16, torch.float]:
+#         for block_size in [16, 32]:
+#             for head_size in [128, 256]:
+#                 print(
+#                     f"Testing single_query_cached_kv_attention with "
+#                     f"dtype={dtype}, block_size={block_size}, "
+#                     f"head_size={head_size}"
+#                 )
+#                 run_single_query_cached_kv_attention(
+#                     num_tokens=1024,
+#                     num_heads=4,
+#                     head_size=head_size,
+#                     block_size=block_size,
+#                     num_blocks=1024,
+#                     dtype=dtype,
+#                     use_lingvo_softmax=True,
+#                 )
